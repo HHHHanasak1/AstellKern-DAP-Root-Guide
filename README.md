@@ -74,6 +74,8 @@ adb shell am start --user 0 -n com.iriver.tester.factorytool/.UserDebugActivity
 一般在升级进度50%之后在根目录下能够看见update.zip。  
 迅速将update.zip拷贝至主机。
 
+> **更新：** 现在不必再和进度条赛跑了。`.hex` 可以直接在电脑上离线解密：`python tools/akhex.py decrypt 1.42.hex 1.42.zip --project sp3000`（`--project` 为机型的 `ro.boot.project_name`，原理和一点点吐槽见[附录](#附录--appendix)）。
+
 #### 2) 解密文件
 请将update.zip内的 payload.bin 解密。
 （推荐使用 payload-dumper  
@@ -220,6 +222,8 @@ While the update is in progress, continuously refresh the device's internal stor
 Typically, after the update progress reaches about 50%, you will see an update.zip file appear in the root directory.  
 Quickly copy this update.zip file to your host machine.
 
+> **Update:** you no longer have to race the progress bar. A `.hex` can be decrypted offline on your PC: `python tools/akhex.py decrypt 1.42.hex 1.42.zip --project sp3000` (`--project` is your model's `ro.boot.project_name`; how it works, plus some light commentary, in the [Appendix](#附录--appendix)).
+
 #### 2) Decrypt the Files
 Extract the payload.bin file from the update.zip.  
 You need to unpack this payload.bin. (Using payload-dumper is recommended).  
@@ -289,6 +293,77 @@ Stay tuned for a guide on how to disable the iRiver OS app whitelist! [@7dollars
   
 **Enjoy It!**
 
+
+## 附录 / Appendix
+
+### 中文：`.hex` 是怎么“加密”的（以及为什么这道防线没有用）
+
+官方 OTA 的 `.hex` 本质上是一个普通的 A/B OTA zip，只是前面绝大部分内容被套了一层 AES。机器上负责解密的是 `TaskService.apk` 里的 `libjniDecHex.so`，细节如下（均已用真机产出的 `update.zip` 逐字节验证，SP3000 的 1.36 与 1.42 完全一致）：
+
+| 项目 | 内容 |
+| --- | --- |
+| 算法 | AES-128，**ECB** 模式 |
+| 分块 | 每 **16 KiB** 一块，块内按 16 字节独立处理 |
+| 尾部 | 最后不足 16 KiB 的部分（`文件大小 % 16384` 字节）**原样保留，不加密** |
+| 密钥 | `("%sKOR" % ro.boot.project_name.upper()).ljust(16, "_")`，例如 SP3000 为 `SP3000KOR_______` |
+| 一个怪癖 | 所谓“解密”分支调用的是 AES **加密**函数；制作 `.hex` 时用的则是 AES **解密**。所以直接用标准 AES 解密只会得到垃圾 |
+
+```python
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+def unhex(src, dst, project="sp3000"):
+    key = ("%sKOR" % project.upper()).ljust(16, "_").encode()
+    aes = Cipher(algorithms.AES(key), modes.ECB()).encryptor()   # 是的，encryptor。
+    size = __import__("os").path.getsize(src); done = 0
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        while buf := fi.read(0x4000):
+            fo.write(aes.update(buf) if done + len(buf) < size else buf)
+            done += len(buf)
+```
+
+完整脚本见 [`tools/akhex.py`](tools/akhex.py)。它只用来**读取**你自己机型的固件包，不能伪造签名，也不能让机器接受被改过的固件。
+
+**关于这道防线，几点观察：**
+
+* 是 **ECB**。就是维基百科用来演示“为什么不要用它”的那个模式，配图是一只企鹅。
+* “密钥”是**机型名 + `KOR` + 下划线**。它更像一张标签而不是密钥：机器解密时还会很体贴地把它打印到 logcat 里（`enc_key = SP3000KOR_______, aes_key = SP3000KOR_______`）。
+* “解密”函数调用的是加密，“加密”工具调用的是解密。对称加密，被对称地写反了，负负得正，居然还能用。
+* 文件末尾，连同 OTA 签名块，被体贴地留成了**明文**，以防有人担心可读性。
+* 解完之后，机器把完整的 `update.zip` **明文**放进 `/sdcard` 根目录，任何有存储权限的应用都能读走。
+* 系统还允许降级，所以你可以让它帮你解密**任何**版本。
+* 1.35 的构建指纹末尾写着 `test-keys`。
+
+一道工事修得很认真，最后所有人从它的侧面走了过去。这就是**马奇诺防线**：精心构筑，正对着错误的方向。
+
+（这不是漏洞报告。固件包本来就是要装进你自己的机器的，这层“加密”从来没有保护过任何东西，只是把大家变成了要和进度条赛跑的人。）
+
+### English: how the `.hex` "encryption" works (and why it protects nothing)
+
+An official OTA `.hex` is an ordinary A/B OTA zip with most of its bytes run through AES. The decryptor lives in `libjniDecHex.so` inside `TaskService.apk`. Everything below was verified byte-for-byte against the `update.zip` the device itself produces (SP3000 1.36 and 1.42).
+
+| Item | Value |
+| --- | --- |
+| Cipher | AES-128 in **ECB** mode |
+| Chunking | **16 KiB** chunks, processed as independent 16-byte blocks |
+| Tail | the last partial chunk (`filesize % 16384` bytes) is copied **unchanged** |
+| Key | `("%sKOR" % ro.boot.project_name.upper()).ljust(16, "_")`, e.g. `SP3000KOR_______` |
+| The quirk | the "decrypt" branch calls AES **encrypt**, and the packages are produced with AES **decrypt**, so a stock AES decrypt yields garbage |
+
+See [`tools/akhex.py`](tools/akhex.py) for a complete script. It only *reads* firmware packages for your own device; it cannot forge signatures.
+
+**Observations on the fortification:**
+
+* It is **ECB**, the mode Wikipedia illustrates with a penguin, as a warning.
+* The "key" is the **model name plus `KOR` plus underscores**. Less a key than a label, and the device helpfully prints it to logcat while decrypting.
+* The decrypt function calls encrypt and the encrypt tool calls decrypt. Symmetric cryptography, symmetrically backwards, and it still works.
+* The end of the file, including the OTA signature block, is left in **plaintext**, in case anyone worried about readability.
+* Afterwards the device drops the fully decrypted `update.zip` in **plaintext** into `/sdcard` for any app with storage access to read.
+* The OS also accepts downgrades, so you can have it decrypt *any* version for you.
+* The build fingerprint of 1.35 ends in `test-keys`.
+
+A carefully engineered wall that everyone simply walks around: the **Maginot Line**.
+
+(This is not a vulnerability report. A firmware package is meant to be installed on your own device; this layer never protected anything, it just turned everyone into people racing a progress bar.)
 
 ## Shout-Outs!
 This success wouldn't have been possible without these legends:  
